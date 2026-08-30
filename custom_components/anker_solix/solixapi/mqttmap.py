@@ -101,6 +101,7 @@ from .mqttcmdmap import (
     CMD_TEMP_UNIT,
     CMD_TEMP_UNIT_V2,
     CMD_TIMER_REQUEST,
+    CMD_TOU_PLAN_FULL_V2,
     CMD_TOU_PLAN_V2,
     CMD_USB_PORT_SWITCH,
     COMMAND_LIST,
@@ -761,16 +762,74 @@ _A1763_0421 = {
         ]
     },
     "d9": {
-        BYTES: {
-            "03": {
+        # TOU system status + backup + Time-of-Use plan.
+        # VARIABLE-LENGTH field: the TOU schedule region is (1 count byte + 3 bytes/slot x count),
+        # so all fields after the schedule shift with the slot count (total = 25 + 3*count bytes).
+        # Use a sequential BYTES list so the parser advances past the variable-length schedule.
+        BYTES: [
+            {
+                NAME: "active_tariff",  # Active tariff at current time: 0=none (UPS), 1=Peak, 2=Mid, 3=Off (device-computed)
+                TYPE: DeviceHexDataTypes.ui.value,
+            },
+            {
+                NAME: "usage_mode",  # TOUSettingSystemStatus: 0=Standard, 1=Time-of-Use, 2=Self-Consumption, 3=Custom
+                TYPE: DeviceHexDataTypes.ui.value,
+            },
+            {
+                NAME: "backup_soc",  # backup reserve % ("TOU power" in app), range [min_soc+5, max_soc]
+                TYPE: DeviceHexDataTypes.ui.value,
+            },
+            {
                 NAME: "max_soc",  # max_soc: 80, 85, 90, 95, 100 %
                 TYPE: DeviceHexDataTypes.ui.value,
             },
-            "04": {
+            {
                 NAME: "min_soc",  # min_soc: 1, 5, 10, 15, 20 %
                 TYPE: DeviceHexDataTypes.ui.value,
             },
-        }
+            {
+                NAME: "tou_mode_schedule",  # count byte + (tariff,start_hr,end_hr) x count; count byte INCLUDED
+                TYPE: DeviceHexDataTypes.bin.value,
+                # counted=True (default): the status schedule starts with a slot count byte
+                STATE_CONVERTER: lambda value, state, cache: (
+                    convert_pps_tou_schedule(value)
+                    if value is not None
+                    else convert_pps_tou_schedule(state)
+                ),
+            },
+            {
+                NAME: "backup_status",  # 0: inactive, 1: planned charge, 2: storm guard charge
+                TYPE: DeviceHexDataTypes.ui.value,
+            },
+            {
+                NAME: "backup_switch",
+                TYPE: DeviceHexDataTypes.ui.value,
+            },
+            {
+                NAME: "storm_guard_switch",
+                TYPE: DeviceHexDataTypes.ui.value,
+            },
+            {
+                NAME: "backup_start_timestamp",
+                TYPE: DeviceHexDataTypes.var.value,
+                SIGNED: False,
+            },
+            {
+                NAME: "backup_end_timestamp",  # 0xffffffff = no end / ongoing
+                TYPE: DeviceHexDataTypes.var.value,
+                SIGNED: False,
+            },
+            {
+                NAME: "auto_backup_start_timestamp",
+                TYPE: DeviceHexDataTypes.var.value,
+                SIGNED: False,
+            },
+            {
+                NAME: "auto_backup_end_timestamp",
+                TYPE: DeviceHexDataTypes.var.value,
+                SIGNED: False,
+            },
+        ]
     },
     # "da": # Field used for screen schedule and theme settings, not supported on device
     "f9": {
@@ -4567,6 +4626,42 @@ SOLIXMQTTMAP: Final[dict] = {
     # PPS C1000 Gen 2
     "A1763": {
         "0057": CMD_REALTIME_TRIGGER,  # for regular status messages 0405 etc
+        "005e": {
+            # Backup charge plan command group (storm guard + backup/fast-charge plan)
+            COMMAND_LIST: [
+                SolixMqttCommands.backup_charge_storm_guard,  # field a3, a4, a5
+                SolixMqttCommands.backup_charge_plan,  # field a3-a5
+                SolixMqttCommands.backup_charge_timestamps,  # field a6-a8
+            ],
+            SolixMqttCommands.backup_charge_storm_guard: CMD_BACKUP_STORM_GUARD_SWITCH_V2,
+            SolixMqttCommands.backup_charge_plan: CMD_BACKUP_SWITCH_V2,
+            SolixMqttCommands.backup_charge_timestamps: CMD_BACKUP_PLAN_TIMESTAMPS_V2,
+        },
+        "0090": {
+            # TOU command group (usage mode + backup SOC + TOU schedule)
+            COMMAND_LIST: [
+                SolixMqttCommands.pps_usage_mode,  # field a2
+                SolixMqttCommands.backup_soc,  # field a5
+                SolixMqttCommands.pps_tou_schedule,  # field a2, a3, a4, a5, a6, a7 (app format)
+            ],
+            SolixMqttCommands.pps_usage_mode: CMD_PPS_USAGE_MODE_V2,
+            SolixMqttCommands.backup_soc: CMD_COMMON_V2
+            | {
+                "a5": {
+                    NAME: "set_backup_soc",  # backup reserve % (TOU power), range [min_soc+5, max_soc], step 1%
+                    TYPE: DeviceHexDataTypes.ui.value,
+                    STATE_NAME: "backup_soc",
+                    VALUE_MIN: 5,
+                    VALUE_MAX: 100,
+                    VALUE_STEP: 1,
+                },
+            },
+            # Full-state TOU command (0090) exactly as the Anker app sends it
+            # (see CMD_TOU_PLAN_FULL_V2). The device merges partial updates, but
+            # the cloud only records the TOU schedule when the command has this
+            # full-state shape with an fe (not fd) timestamp.
+            SolixMqttCommands.pps_tou_schedule: CMD_TOU_PLAN_FULL_V2,
+        },
         "0101": {
             # AC command group
             COMMAND_LIST: [
@@ -5337,6 +5432,8 @@ SOLIXMQTTMAP: Final[dict] = {
                 SolixMqttCommands.backup_soc,  # field a5
             ],
             SolixMqttCommands.pps_usage_mode: CMD_PPS_USAGE_MODE_V2,  # 0=Standard, 1=Time-of-Use, 2=Self-Consumption, 3=Custom
+            # AS220 uses CMD_TOU_PLAN_V2 (fd ms timestamp, slot count inline in a7);
+            # A1763 uses CMD_TOU_PLAN_FULL_V2 (fe timestamp, count in the separate a6 field)
             SolixMqttCommands.pps_tou_schedule: CMD_TOU_PLAN_V2,
             SolixMqttCommands.backup_soc: CMD_COMMON_V2
             | {

@@ -93,6 +93,7 @@ SERVICE_API_REQUEST: Final[str] = "api_request"
 
 START_TIME: Final[str] = "start_time"
 END_TIME: Final[str] = "end_time"
+TOU_SLOTS: Final[str] = "slots"
 PLAN: Final[str] = "plan"
 WEEK_DAYS: Final[str] = "week_days"
 LOAD_TYPE: Final[str] = "load_type"
@@ -343,6 +344,12 @@ SOLIX_BACKUP_CHARGE_SCHEMA: vol.Schema = vol.All(
     ),
 )
 
+# Validator for a TOU slot hour ("HH:MM" or "HH:MM:SS"), normalized to "HH:MM", hour 0-24
+VALID_TOU_HOUR = vol.All(
+    lambda v: ":".join(str(v).split(":")[:2]),
+    vol.Match(r"^([01]?\d|2[0-4]):[0-5]\d$"),
+)
+
 SOLIX_USE_TIME_SCHEMA: vol.Schema = vol.All(
     cv.make_entity_service_schema(
         {
@@ -407,6 +414,21 @@ SOLIX_USE_TIME_SCHEMA: vol.Schema = vol.All(
                 extractNone, vol.Any(None, cv.positive_float)
             ),
             vol.Optional(DELETE): VALID_SWITCH,
+            # PPS hourly time-of-use schedule (list of up to 6 tariff slots). Used by
+            # PPS devices (e.g. A1763 SOLIX C1000 Gen 2); ignored for SB2 AC devices,
+            # which use the seasonal start_month/end_month/day_type/hour/tariff fields.
+            vol.Optional(TOU_SLOTS): vol.All(
+                vol.Length(min=1, max=6, msg="1-6 TOU slots required"),
+                [
+                    vol.Schema(
+                        {
+                            vol.Required("tariff"): vol.In([1, 2, 3]),
+                            vol.Required(START_TIME): VALID_TOU_HOUR,
+                            vol.Required(END_TIME): VALID_TOU_HOUR,
+                        }
+                    )
+                ],
+            ),
         }
     ),
 )

@@ -534,20 +534,33 @@ def convert_pps_custom_schedule(
 
 
 def convert_pps_tou_schedule(
-    value: bytes | bytearray | dict, min_slots: int = 0, max_slots: int = 6
+    value: bytes | bytearray | dict,
+    min_slots: int = 0,
+    max_slots: int = 6,
+    counted: bool = True,
 ) -> bytearray | dict | None:
     """Convert between PPS time of use schedule dictionary and binary field as used in MQTT messages.
 
     Automatically detects input value type and converts accordingly. The dictionary structure:
-    Byte with slot count
+    Byte with slot count (only when counted=True)
     Each slot has 3 bytes: tariff: (1=Peak,2=Mid,3=Off), start_hr, end_hr
     max 6 slots are allowed in the app
     The price per tariff is not part of the structure, this may be maintained by App/Cloud only
+
+    Some models (e.g. A1763 SOLIX C1000 Gen 2) carry the slot count in a separate
+    field rather than as a leading byte of the schedule; the schedule field is then
+    bare (tariff, start_hr, end_hr) x N triplets with no inline count. Set
+    counted=False for those. Reading stops when the field bytes are exhausted or a
+    (0,0,0) triplet is encountered.
 
     Args:
         value: dictionary or binary with schedule structure
         min_slots: Trailing bytes will be added if min slots > found slots (ignored for dictionary extract)
         max_slots: Max bytes slots to be extracted, None returned if dictionary exceeds max
+        counted: True when the binary starts with a slot count byte (AS220,
+            and the A1763 0421 status d9 region), False when the schedule is bare
+            (tariff, start_hr, end_hr) x N triplets with the count carried elsewhere
+            (A1763 0090 command a7)
 
     Returns:
         Dictionary with schedule if input is bytes/bytearray.
@@ -560,27 +573,46 @@ def convert_pps_tou_schedule(
         with contextlib.suppress(ValueError, TypeError):
             pos = 0
             schedule = {}
-            if slots := int.from_bytes(value[:1]):
+            if counted:
+                if slots := int.from_bytes(value[:1]):
+                    schedule["ranges"] = []
+                    pos += 1
+                for _ in range(slots):
+                    start = int.from_bytes(value[pos + 1 : pos + 2], byteorder="little")
+                    end = int.from_bytes(value[pos + 2 : pos + 3], byteorder="little")
+                    slot = {
+                        "tariff": int.from_bytes(value[pos : pos + 1], byteorder="little"),
+                        "start_time": f"{start:02d}:00",
+                        "end_time": f"{end:02d}:00",
+                    }
+                    schedule["ranges"].append(slot)
+                    pos += 3
+            else:
+                # No count byte: zero-terminated (tariff, start_hr, end_hr) triplets
                 schedule["ranges"] = []
-                pos += 1
-            for _ in range(slots):
-                start = int.from_bytes(value[pos + 1 : pos + 2], byteorder="little")
-                end = int.from_bytes(value[pos + 2 : pos + 3], byteorder="little")
-                slot = {
-                    "tariff": int.from_bytes(value[pos : pos + 1], byteorder="little"),
-                    "start_time": f"{start:02d}:00",
-                    "end_time": f"{end:02d}:00",
-                }
-                schedule["ranges"].append(slot)
-                pos += 3
+                while pos + 3 <= len(value):
+                    tariff = int.from_bytes(value[pos : pos + 1], byteorder="little")
+                    start = int.from_bytes(value[pos + 1 : pos + 2], byteorder="little")
+                    end = int.from_bytes(value[pos + 2 : pos + 3], byteorder="little")
+                    if tariff == 0 and start == 0 and end == 0:
+                        break
+                    schedule["ranges"].append(
+                        {
+                            "tariff": tariff,
+                            "start_time": f"{start:02d}:00",
+                            "end_time": f"{end:02d}:00",
+                        }
+                    )
+                    pos += 3
             return schedule
     if isinstance(value, dict):
         # convert elements to binary structure
         with contextlib.suppress(ValueError, TypeError):
             hexvalue = bytearray()
             slots = value.get("ranges", [])
-            # limit count to max converted slots
-            hexvalue.extend(min(len(slots), max_slots).to_bytes(byteorder="little"))
+            if counted:
+                # limit count to max converted slots
+                hexvalue.extend(min(len(slots), max_slots).to_bytes(byteorder="little"))
             # adopt slot list according to limits
             if len(slots) < min_slots:
                 slots.extend({} for _ in range(min_slots - len(slots)))

@@ -144,6 +144,9 @@ class SolixMqttCommands:
     backup_soc: str = "backup_soc"
     pps_usage_mode: str = "pps_usage_mode"
     pps_tou_schedule: str = "tou_schedule"
+    # Per-model field maps differ: AS220 uses CMD_TOU_PLAN_V2 (fd ms
+    # timestamp, slot count inline in a7), A1763 uses the full-state app format
+    # (fe unix-seconds timestamp, slot count in the separate a6 field).
     pps_custom_schedule: str = "pps_custom_schedule"
     pps_output_schedule: str = "pps_output_schedule"
     silent_schedule: str = "silent_schedule"
@@ -2461,6 +2464,72 @@ CMD_TOU_PLAN_V2 = CMD_PPS_USAGE_MODE_V2 | {
             convert_pps_tou_schedule(value)
             if value is not None
             else convert_pps_tou_schedule(state)
+        ),
+    },
+}
+
+CMD_TOU_PLAN_FULL_V2 = CMD_COMMON | {
+    # Full-state TOU plan exactly as the Anker app sends it. Verified
+    # byte-for-byte for A1763 (SOLIX C1000 Gen 2) against captured app
+    # commands; this PR addresses A1763 only (the other Gen 2 models are not
+    # covered here). Differences from CMD_TOU_PLAN_V2 (AS220): unix-seconds fe
+    # timestamp (vs fd ms), the slot count in the separate a6 field (vs an
+    # inline leading byte in a7), and a6 auto-derived from the a7 slot count
+    # (vs a fixed option set).
+    "a2": CMD_PPS_USAGE_MODE_V2["a2"],  # usage mode (0=UPS, 1=TOU, 2=Self-Cons, 3=Custom)
+    "a3": {  # app sends 0 (plan id / reserved)
+        NAME: "set_tou_a3",
+        TYPE: DeviceHexDataTypes.ui.value,
+        VALUE_DEFAULT: 0,
+    },
+    "a4": {  # app sends 0 (reserved)
+        NAME: "set_tou_a4",
+        TYPE: DeviceHexDataTypes.ui.value,
+        VALUE_DEFAULT: 0,
+    },
+    "a5": {  # backup reserve % (TOU power)
+        NAME: "set_backup_soc",
+        TYPE: DeviceHexDataTypes.ui.value,
+        STATE_NAME: "backup_soc",
+        VALUE_MIN: 5,
+        VALUE_MAX: 100,
+        VALUE_STEP: 1,
+    },
+    "a6": {
+        NAME: "set_tou_slot_count",
+        TYPE: DeviceHexDataTypes.ui.value,
+        STATE_NAME: "tou_slot_count",
+        # 1-6 slots, as enforced by the app
+        VALUE_MIN: 1,
+        VALUE_MAX: 6,
+        VALUE_STEP: 1,
+        # Auto-derived from the number of slots in the TOU schedule (a7) when
+        # not provided explicitly; the converter is also called with the
+        # explicit count (validate_cmd_value passes it in the state slot, the
+        # mock-state paths pass it in the value slot), so pass ints through.
+        VALUE_FOLLOWS: "tou_mode_schedule",
+        STATE_CONVERTER: lambda value, state, cache: (
+            len(state["ranges"])
+            if isinstance(state, dict) and "ranges" in state
+            else state
+            if isinstance(state, int)
+            else value
+            if isinstance(value, int)
+            else None
+        ),
+    },
+    "a7": {
+        NAME: "set_tou_mode_schedule",
+        TYPE: DeviceHexDataTypes.bin.value,
+        STATE_NAME: "tou_mode_schedule",
+        # The slot count lives in the separate a6 field, NOT as an inline
+        # leading byte (unlike the 0421 status d9 region, where the count is the
+        # first byte). So a7 is bare (tariff, start_hr, end_hr) x N triplets
+        # -> counted=False.
+        STATE_CONVERTER: lambda value, state, cache: (
+            convert_pps_tou_schedule(value, counted=False)
+            if value is not None
+            else convert_pps_tou_schedule(state, counted=False)
         ),
     },
 }

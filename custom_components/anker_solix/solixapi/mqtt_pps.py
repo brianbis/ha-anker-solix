@@ -6,6 +6,7 @@ These methods provide comprehensive device control via MQTT commands.
 
 from __future__ import annotations  # noqa: TID251
 
+import json
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -75,7 +76,7 @@ FEATURES = {
     SolixMqttCommands.pps_usage_mode: MODELS,
     SolixMqttCommands.silent_schedule: MODELS,
     # SolixMqttCommands.pps_custom_schedule: MODELS,  # TODO: Enable once fully supported
-    # SolixMqttCommands.pps_tou_schedule: MODELS,  # TODO: Enable once fully supported
+    SolixMqttCommands.pps_tou_schedule: MODELS,
     # SolixMqttCommands.pps_output_schedule: MODELS,  # TODO: Enable once fully supported
     SolixMqttCommands.backup_soc: MODELS,
     SolixMqttCommands.backup_charge_storm_guard: MODELS,
@@ -129,6 +130,10 @@ class SolixMqttDevicePps(SolixMqttDevice):
     ) -> dict | None:
         """Update the presets from actual time of use plan based on time.
 
+        The device reports the currently active tariff directly in the 0421
+        status (d9[0]: 0=none/UPS, 1=Peak, 2=Mid, 3=Off), so the active TOU
+        preset is exposed without recomputing it from the schedule + time.
+
         Args:
             fromFile: If True, consider the mocked cache
 
@@ -141,8 +146,10 @@ class SolixMqttDevicePps(SolixMqttDevice):
         """
         cache = self.get_status(fromFile=fromFile)
         presets = {}
-        schedule = cache.get("tou_mode_schedule") or {}  # noqa: F841
-        # TODO: Add code to extract active preset
+        # The device reports the currently active tariff directly (0421.d9[0]);
+        # expose it as the active TOU preset (0=none, 1=Peak, 2=Mid, 3=Off).
+        if (active := cache.get("active_tariff")) is not None:
+            presets["preset_tariff"] = int(active)
         return presets
 
     async def set_backup_charge_plan(
@@ -253,6 +260,213 @@ class SolixMqttDevicePps(SolixMqttDevice):
                 return None
             resp.update(result)
         return resp or None
+
+    async def set_tou_schedule(
+        self,
+        schedule: list[dict] | dict | None = None,
+        toFile: bool = False,  # used for testing with files
+    ) -> dict | None:
+        """Set the PPS time-of-use schedule (list of up to 6 tariff slots).
+
+        Each slot is a dict with keys: tariff (1=Peak, 2=Mid, 3=Off),
+        start_time ("HH:MM"), end_time ("HH:MM"). Slots should be contiguous
+        and cover the day (00:00-24:00).
+
+        The schedule is applied through two paths so that both the device and
+        the Anker app reflect the change:
+        1. A full-state MQTT 0090 command (usage mode + backup SOC + schedule),
+           sent exactly as the Anker app sends it, updates the device directly.
+        2. A commit to the cloud store (the ``pps_use_time`` device attribute)
+           updates the authoritative copy the Anker app reads. Without this the
+           app would keep showing the previous schedule, since the app does not
+           read the device state for the TOU plan.
+
+        The slot count (a6) of the MQTT command is derived automatically from
+        the slots.
+
+        Args:
+            schedule: List of slot dicts, or a dict with a "ranges" key holding the list.
+            toFile: If True, save mock response (for testing compatibility).
+
+        Returns:
+            dict: Mocked state if successful, None otherwise.
+
+        Example:
+            await mydevice.set_tou_schedule([
+                {"tariff": 1, "start_time": "00:00", "end_time": "08:00"},
+                {"tariff": 2, "start_time": "08:00", "end_time": "09:00"},
+                {"tariff": 3, "start_time": "09:00", "end_time": "24:00"},
+            ])
+
+        """
+        # normalize input to a list of slot dicts
+        if isinstance(schedule, dict):
+            ranges = schedule.get("ranges", [])
+        elif isinstance(schedule, list):
+            ranges = schedule
+        else:
+            self._logger.error(
+                "No valid TOU schedule provided for device %s (%s)", self.sn, self.pn
+            )
+            return None
+        # validate slot count and structure
+        if not isinstance(ranges, list) or not (1 <= len(ranges) <= 6):
+            self._logger.error(
+                "Invalid TOU schedule (need 1-6 slots) for device %s (%s)",
+                self.sn,
+                self.pn,
+            )
+            return None
+        for slot in ranges:
+            if not isinstance(slot, dict) or not all(
+                k in slot for k in ("tariff", "start_time", "end_time")
+            ):
+                self._logger.error(
+                    "Invalid TOU slot (need tariff/start_time/end_time) for device %s: %s",
+                    self.sn,
+                    slot,
+                )
+                return None
+            if slot.get("tariff") not in (1, 2, 3):
+                self._logger.error(
+                    "Invalid TOU tariff (need 1=Peak, 2=Mid, 3=Off) for device %s: %s",
+                    self.sn,
+                    slot,
+                )
+                return None
+        # Read the cloud pps_use_time (the authoritative TOU store) once. It is
+        # used to commit the new schedule back to the cloud so the Anker app
+        # reflects the change (the app reads the TOU plan from the cloud, not the
+        # device). Its reserve_power is kept only as a fallback for the 0090
+        # backup SOC when the device cache has no value. A read failure must not
+        # prevent the device 0090, so on error the commit re-reads the cloud.
+        pps: dict | None = None
+        try:
+            cloud = await self.api.get_device_attributes(
+                deviceSn=self.sn, attributes=["pps_use_time"], fromFile=toFile
+            )
+            raw = ((cloud or {}).get("attributes") or {}).get("pps_use_time")
+            if isinstance(raw, str) and raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    pps = parsed
+        except Exception:  # noqa: BLE001 - a cloud read failure must not block the 0090
+            pps = None
+        # Build the full-state 0090 command exactly as the Anker app sends it
+        # (usage mode a2, plan id/switch a3/a4, backup SOC a5, slot count a6,
+        # schedule a7, unix-seconds timestamp fe). The device merges partial
+        # updates, but the cloud only records the TOU schedule when the command
+        # carries the full state with an fe timestamp, so read the current usage
+        # mode + backup SOC and include them.
+        cache = self.get_status(fromFile=toFile)
+        parm_map = {
+            "set_tou_mode_schedule": {"ranges": ranges},
+            "set_tou_slot_count": len(ranges),
+        }
+        if (usage_mode := cache.get("usage_mode")) is not None:
+            parm_map["set_usage_mode"] = int(usage_mode)
+        # Backup SOC: preserve the device's current value (from cache) so that
+        # setting the TOU schedule does not change the backup SOC. The
+        # pps_backup_soc number entity sets the device's backup SOC without
+        # committing to the cloud, so the device's value reflects the user's
+        # latest choice. Fall back to the cloud's reserve_power only if the
+        # device cache has no value.
+        backup_soc = cache.get("backup_soc")
+        if backup_soc is None and pps is not None:
+            rp = pps.get("reserve_power")
+            if isinstance(rp, (int, float)) and rp > 0:
+                backup_soc = int(rp)
+        if backup_soc is not None:
+            parm_map["set_backup_soc"] = int(backup_soc)
+        if (
+            result := await self.run_command(
+                cmd=SolixMqttCommands.pps_tou_schedule,
+                parm_map=parm_map,
+                toFile=toFile,
+            )
+        ) is None:
+            return None
+        # Commit the schedule to the cloud store (reusing the already-read pps
+        # dict to avoid a second read), so the Anker app reflects the change.
+        try:
+            committed = await self._commit_tou_to_cloud(
+                ranges=ranges, toFile=toFile, base=pps
+            )
+        except Exception as err:  # noqa: BLE001 - a cloud failure must not block the 0090
+            self._logger.warning(
+                "Cloud TOU commit failed for device %s (%s): %s (the device was "
+                "updated via MQTT, but the Anker app may not reflect the new schedule)",
+                self.sn,
+                self.pn,
+                err,
+            )
+            return result
+        if not isinstance(committed, dict):
+            self._logger.warning(
+                "Cloud TOU commit failed for device %s (%s): the device was updated "
+                "via MQTT, but the Anker app may not reflect the new schedule",
+                self.sn,
+                self.pn,
+            )
+        return result
+
+    async def _commit_tou_to_cloud(
+        self,
+        ranges: list[dict],
+        toFile: bool = False,
+        base: dict | None = None,
+    ) -> dict | None:
+        """Commit the TOU schedule to the cloud store (pps_use_time attribute).
+
+        The Anker app reads the PPS TOU schedule from the cloud ``pps_use_time``
+        device attribute, not from the device state. A direct MQTT 0090 command
+        updates the device but not this cloud store, so the app would keep showing
+        the old schedule. This method reads the current ``pps_use_time`` value,
+        replaces its ``ranges`` with the provided schedule (preserving ``prices``,
+        ``unit`` and ``reserve_power``), and writes it back so both the app and the
+        device (via the cloud's 0090 push) reflect the new schedule.
+
+        Args:
+            ranges: List of slot dicts with keys tariff (1=Peak, 2=Mid, 3=Off),
+                start_time, end_time.
+            toFile: If True, use the mocked file cache (testmode).
+            base: Optional already-read cloud pps_use_time dict (avoids a second
+                read when the caller already fetched it). When None, the cloud
+                is read here.
+
+        Returns:
+            dict: The updated cloud attributes, or None on failure.
+
+        """
+        if base is not None:
+            # Use the already-read cloud pps_use_time (a dict)
+            pps: dict = dict(base) if isinstance(base, dict) else {}
+        else:
+            # Read the current cloud pps_use_time (a JSON string)
+            attr = await self.api.get_device_attributes(
+                deviceSn=self.sn, attributes=["pps_use_time"], fromFile=toFile
+            )
+            raw = ((attr or {}).get("attributes") or {}).get("pps_use_time")
+            pps = {}
+            if isinstance(raw, str) and raw:
+                try:
+                    pps = json.loads(raw)
+                except (ValueError, TypeError):
+                    pps = {}
+            if not isinstance(pps, dict):
+                pps = {}
+        # Build the cloud ranges (the cloud uses "type" where the schedule uses "tariff")
+        pps["ranges"] = [
+            {"start_time": s["start_time"], "end_time": s["end_time"], "type": s["tariff"]}
+            for s in ranges
+        ]
+        # Write back, preserving prices / unit / reserve_power
+        return await self.api.set_device_attributes(
+            deviceSn=self.sn,
+            attributes={"pps_use_time": json.dumps(pps, separators=(",", ":"))},
+            query_attributes=["pps_use_time"],
+            toFile=toFile,
+        )
 
     async def set_ac_output(
         self,

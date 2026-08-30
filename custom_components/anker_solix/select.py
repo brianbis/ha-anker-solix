@@ -44,8 +44,11 @@ from .const import (
     SERVICE_MODIFY_SOLIX_USE_TIME,
     START_HOUR,
     START_MONTH,
+    START_TIME,
+    END_TIME,
     TARIFF,
     TARIFF_PRICE,
+    TOU_SLOTS,
 )
 from .coordinator import AnkerSolixDataUpdateCoordinator
 from .entity import (
@@ -560,6 +563,7 @@ DEVICE_SELECTS = [
         exclude_fn=lambda s, d: (
             not (({d.get("type")} - s) & {SolixDeviceType.PPS.value})
         ),
+        feature=AnkerSolixEntityFeature.TOU_SCHEDULE,
         mqtt=True,
         mqtt_cmd=SolixMqttCommands.pps_usage_mode,
     ),
@@ -2347,7 +2351,13 @@ class AnkerSolixSelect(CoordinatorEntity, SelectEntity):
     ) -> dict | None:
         """Execute the defined solix ac charge action."""
         # Raise alerts to frontend
-        if not (self.supported_features & AnkerSolixEntityFeature.AC_CHARGE):
+        if not (
+            self.supported_features
+            & (
+                AnkerSolixEntityFeature.AC_CHARGE
+                | AnkerSolixEntityFeature.TOU_SCHEDULE
+            )
+        ):
             raise ServiceValidationError(
                 f"The entity {self.entity_id} does not support the action {service_name}",
                 translation_domain=DOMAIN,
@@ -2386,19 +2396,51 @@ class AnkerSolixSelect(CoordinatorEntity, SelectEntity):
             data: dict = self.coordinator.data.get(self.coordinator_context) or {}
             if service_name == SERVICE_MODIFY_SOLIX_USE_TIME:
                 LOGGER.debug("%s action will be applied", service_name)
-                result = await self.coordinator.client.api.set_sb2_use_time(
-                    siteId=data.get("site_id") or "",
-                    deviceSn=self.coordinator_context,
-                    start_month=kwargs.get(START_MONTH),
-                    end_month=kwargs.get(END_MONTH),
-                    start_hour=kwargs.get(START_HOUR),
-                    end_hour=kwargs.get(END_HOUR),
-                    day_type=kwargs.get(DAY_TYPE),
-                    tariff_type=kwargs.get(TARIFF),
-                    tariff_price=kwargs.get(TARIFF_PRICE),
-                    delete=kwargs.get(DELETE),
-                    toFile=self.coordinator.client.testmode(),
-                )
+                if self.supported_features & AnkerSolixEntityFeature.TOU_SCHEDULE:
+                    # PPS device: set the hourly peak/mid/off TOU schedule via MQTT
+                    if not (
+                        mdev := self.coordinator.client.get_mqtt_device(
+                            self.coordinator_context
+                        )
+                    ):
+                        raise ServiceValidationError(
+                            f"The entity {self.entity_id} has no MQTT device for action {service_name}",
+                            translation_domain=DOMAIN,
+                            translation_key="service_not_supported",
+                            translation_placeholders={
+                                "entity": self.entity_id,
+                                "service": service_name,
+                            },
+                        )
+                    if not kwargs.get(TOU_SLOTS):
+                        raise ServiceValidationError(
+                            f"The entity {self.entity_id} requires the 'slots' field to set the TOU schedule",
+                            translation_domain=DOMAIN,
+                            translation_key="service_not_supported",
+                            translation_placeholders={
+                                "entity": self.entity_id,
+                                "service": service_name,
+                            },
+                        )
+                    result = await mdev.set_tou_schedule(
+                        schedule=kwargs.get(TOU_SLOTS),
+                        toFile=self.coordinator.client.testmode(),
+                    )
+                else:
+                    # SB2 device: set the seasonal AC use-time plan via the cloud API
+                    result = await self.coordinator.client.api.set_sb2_use_time(
+                        siteId=data.get("site_id") or "",
+                        deviceSn=self.coordinator_context,
+                        start_month=kwargs.get(START_MONTH),
+                        end_month=kwargs.get(END_MONTH),
+                        start_hour=kwargs.get(START_HOUR),
+                        end_hour=kwargs.get(END_HOUR),
+                        day_type=kwargs.get(DAY_TYPE),
+                        tariff_type=kwargs.get(TARIFF),
+                        tariff_price=kwargs.get(TARIFF_PRICE),
+                        delete=kwargs.get(DELETE),
+                        toFile=self.coordinator.client.testmode(),
+                    )
             else:
                 raise ServiceValidationError(
                     f"The entity {self.entity_id} does not support the action {service_name}",

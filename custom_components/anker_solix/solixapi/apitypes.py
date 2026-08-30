@@ -135,8 +135,8 @@ API_ENDPOINTS: Final[dict] = {
     "get_device_fittings": "power_service/v1/app/get_relate_device_fittings",  # Device fittings for given site id and device sn. Shows Accessories like Solarbank 0W Switch info
     "get_upgrade_record": "power_service/v1/app/get_upgrade_record",  # get list of firmware update history
     "check_upgrade_record": "power_service/v1/app/check_upgrade_record",  # show an upgrade record for the device, types 1-3 show different info, only works for owner account
-    "get_device_attributes": "power_service/v1/app/device/get_device_attrs",  # for solarbank and/or smart meter? {"device_sn":sn,"attributes":["rssi","pv_power_limit","legal_power_limit","power_limit_option","power_limit_option_real","switch_0w"]}
-    "set_device_attributes": "power_service/v1/app/device/set_device_attrs",  # attr name may be different than for get, {"device_sn":sn,"attributes":{"pv_power_limit":800,"ac_power_limit":1200,"power_limit":800}}
+    "get_device_attributes": "power_service/v1/app/device/get_device_attrs",  # device attributes; {"device_sn":sn,"attributes":["rssi","pv_power_limit","switch_0w",...]}. For PPS the "pps_use_time" attribute holds the cloud TOU store (JSON string: {"ranges":[{start_time,end_time,type 1=Peak/2=Mid/3=Off}],"prices":[{price,type}],"unit","reserve_power"}) - the authoritative copy the Anker app reads for the TOU plan
+    "set_device_attributes": "power_service/v1/app/device/set_device_attrs",  # attr name may be different than for get, {"device_sn":sn,"attributes":{"pv_power_limit":800,"ac_power_limit":1200,"power_limit":800}}. For PPS the "pps_use_time" attribute commits the TOU plan to the cloud store (JSON string, see get_device_attributes) so the Anker app reflects the schedule
     "get_config": "power_service/v1/app/get_config",  # shows empty config list, also for shared account
     "get_installation": "power_service/v1/app/compatible/get_installation",  # shows install_mode and solar_sn, also for shared account
     "set_installation": "power_service/v1/app/compatible/set_installation",  # not explored yet
